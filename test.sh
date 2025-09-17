@@ -1,39 +1,41 @@
 #!/bin/bash
 set -euo pipefail
 
-# OpenVPN One-Click Installer + Admin Panel
+# ===== OpenVPN + Simple Admin Panel (All-in-one) =====
+# Ubuntu 20.04 / 22.04
+# Run: sudo bash openvpn-oneclick.sh
+
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Run as root (sudo)"
-  exit 1
+  echo "Run as root (sudo)."; exit 1
 fi
 
-# Default admin login
+# ----- Defaults -----
 ADMIN_USER="openvpn"
 ADMIN_PASS="$(tr -dc 'A-Z0-9' </dev/urandom | fold -w5 | head -n1)"
-
-# Vars
-OVPN_PORT=1194
-PROTO=udp
-SERVER_IP="$(curl -s ifconfig.me)"
-VPN_NET="10.8.0.0"
-VPN_NET_MASK="255.255.255.0"
 OPENVPN_DIR="/etc/openvpn"
 PKI_DIR="/etc/openvpn/easy-rsa"
 ADMIN_DIR="/etc/openvpn-admin"
 STATUS_LOG="/var/log/openvpn-status.log"
 OPENVPN_LOG="/var/log/openvpn.log"
 FLASK_PORT=8080
+OVPN_PORT=1194
+PROTO=udp
+VPN_NET="10.8.0.0"
+VPN_NET_MASK="255.255.255.0"
 
-echo "[1/6] Installing dependencies..."
+# Public IP (robust)
+SERVER_IP="$(curl -fsS ifconfig.me || curl -fsS ipinfo.io/ip || hostname -I | awk '{print $1}')"
+
+echo "[1/8] Installing packages..."
 apt update -y
 DEBIAN_FRONTEND=noninteractive apt install -y openvpn easy-rsa python3 python3-venv python3-pip nginx iptables-persistent curl
 
-echo "[2/6] Setting up PKI..."
+echo "[2/8] Preparing Easy-RSA/PKI..."
 mkdir -p "$PKI_DIR"
 if [ -d /usr/share/easy-rsa ]; then
-  cp -r /usr/share/easy-rsa/* "$PKI_DIR/"
+  cp -r /usr/share/easy-rsa/* "$PKI_DIR/" || true
 elif [ -d /usr/share/easy-rsa-3 ]; then
-  cp -r /usr/share/easy-rsa-3/* "$PKI_DIR/"
+  cp -r /usr/share/easy-rsa-3/* "$PKI_DIR/" || true
 fi
 cd "$PKI_DIR"
 
@@ -51,10 +53,23 @@ EOF
   cp pki/issued/server.crt "$OPENVPN_DIR/"
   cp pki/private/server.key "$OPENVPN_DIR/"
   cp pki/dh.pem "$OPENVPN_DIR/dh.pem"
+
+  # **CRITICAL FIX**: create initial CRL so crl-verify won't fail
+  ./easyrsa gen-crl
+  cp pki/crl.pem "$OPENVPN_DIR/crl.pem"
+  chown nobody:nogroup "$OPENVPN_DIR/crl.pem" || true
+  chmod 644 "$OPENVPN_DIR/crl.pem" || true
 fi
 
-echo "[3/6] Configuring OpenVPN..."
-cat > "$OPENVPN_DIR/server.conf" <<EOF
+echo "[3/8] Writing server config..."
+# Make sure status/log files exist first
+touch "$STATUS_LOG" "$OPENVPN_LOG" || true
+chown nobody:nogroup "$STATUS_LOG" || true
+
+# Write to both locations for max compatibility
+mkdir -p "$OPENVPN_DIR/server"
+for CFG in "$OPENVPN_DIR/server.conf" "$OPENVPN_DIR/server/server.conf"; do
+cat > "$CFG" <<EOF
 port ${OVPN_PORT}
 proto ${PROTO}
 dev tun
@@ -62,6 +77,7 @@ ca /etc/openvpn/ca.crt
 cert /etc/openvpn/server.crt
 key /etc/openvpn/server.key
 dh /etc/openvpn/dh.pem
+topology subnet
 server ${VPN_NET} ${VPN_NET_MASK}
 ifconfig-pool-persist /var/log/ipp.txt
 push "redirect-gateway def1 bypass-dhcp"
@@ -81,25 +97,42 @@ group nogroup
 persist-key
 persist-tun
 EOF
+done
 
-sysctl -w net.ipv4.ip_forward=1
+echo "[4/8] Enabling IP forwarding + NAT..."
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
 
-# NAT
-IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')
+IFACE="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
 iptables -t nat -C POSTROUTING -s ${VPN_NET}/24 -o "$IFACE" -j MASQUERADE 2>/dev/null || \
 iptables -t nat -A POSTROUTING -s ${VPN_NET}/24 -o "$IFACE" -j MASQUERADE
-netfilter-persistent save
+netfilter-persistent save >/dev/null
 
-systemctl enable openvpn@server
-systemctl restart openvpn@server
+echo "[5/8] Starting OpenVPN service..."
+# Prefer new-style unit; fallback to old one
+if systemctl list-unit-files | grep -q '^openvpn-server@\.service'; then
+  SYSTEMD_UNIT="openvpn-server@server"
+else
+  SYSTEMD_UNIT="openvpn@server"
+fi
+systemctl enable "$SYSTEMD_UNIT"
+systemctl restart "$SYSTEMD_UNIT"
 
-echo "[4/6] Installing Admin Panel..."
+# quick sanity check
+sleep 1
+if ! systemctl is-active --quiet "$SYSTEMD_UNIT"; then
+  echo "OpenVPN failed to start. Showing last logs..."
+  journalctl -u "$SYSTEMD_UNIT" -n 50 --no-pager || true
+  exit 1
+fi
+
+echo "[6/8] Installing Admin Panel..."
 mkdir -p "$ADMIN_DIR"
 cd "$ADMIN_DIR"
 python3 -m venv venv
 . venv/bin/activate
-pip install flask flask-httpauth pyyaml
+pip install --upgrade pip >/dev/null
+pip install Flask==2.2.5 Flask-HTTPAuth==4.7.0 pyyaml >/dev/null
 
 cat > .env <<EOF
 ADMIN_USER=${ADMIN_USER}
@@ -111,6 +144,7 @@ STATUS_LOG=${STATUS_LOG}
 OPENVPN_LOG=${OPENVPN_LOG}
 SERVER_IP=${SERVER_IP}
 EOF
+chmod 600 .env
 
 cat > app.py <<'PY'
 from flask import Flask, request, redirect, url_for, send_file, render_template_string, flash
@@ -118,49 +152,67 @@ from flask_httpauth import HTTPBasicAuth
 import os, subprocess, sqlite3, time, socket
 
 ENVFILE='/etc/openvpn-admin/.env'
+
 def load_env():
     env={}
     with open(ENVFILE) as f:
         for l in f:
-            if '=' in l: k,v=l.strip().split('=',1); env[k]=v
+            if '=' in l:
+                k,v=l.strip().split('=',1); env[k]=v
     return env
 
 env=load_env()
 OPENVPN_DIR=env['OPENVPN_DIR']; PKI_DIR=env['PKI_DIR']
 STATUS_LOG=env['STATUS_LOG']; OPENVPN_LOG=env['OPENVPN_LOG']
 SERVER_IP=env['SERVER_IP']; DB_PATH='/etc/openvpn-admin/users.db'
+FLASK_PORT=int(env.get('FLASK_PORT','8080'))
 
 app=Flask(__name__); app.secret_key=os.urandom(24); auth=HTTPBasicAuth()
+
 @auth.verify_password
-def verify(u,p): e=load_env(); return u==e['ADMIN_USER'] and p==e['ADMIN_PASS']
+def verify(u,p):
+    e=load_env()
+    return (u==e.get('ADMIN_USER')) and (p==e.get('ADMIN_PASS'))
 
 def init_db():
-  conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-  c.execute('CREATE TABLE IF NOT EXISTS clients(name TEXT PRIMARY KEY, created_at TEXT)')
-  conn.commit(); conn.close()
+    conn=sqlite3.connect(DB_PATH)
+    c=conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS clients(name TEXT PRIMARY KEY, created_at TEXT)')
+    conn.commit(); conn.close()
 init_db()
 
+def run(cmd, **kw):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
+
 def create_client(name):
-  subprocess.run([f"{PKI_DIR}/easyrsa","build-client-full",name,"nopass"],cwd=PKI_DIR)
+    name=name.replace('/','').replace('..','')
+    return run([f"{PKI_DIR}/easyrsa","build-client-full",name,"nopass"], cwd=PKI_DIR)
+
 def revoke_client(name):
-  subprocess.run([f"{PKI_DIR}/easyrsa","revoke",name],cwd=PKI_DIR,input="yes\n",text=True)
-  subprocess.run([f"{PKI_DIR}/easyrsa","gen-crl"],cwd=PKI_DIR)
-  subprocess.run(["cp",f"{PKI_DIR}/pki/crl.pem",f"{OPENVPN_DIR}/crl.pem"])
+    name=name.replace('/','').replace('..','')
+    r=run([f"{PKI_DIR}/easyrsa","revoke",name], cwd=PKI_DIR, input="yes\n")
+    run([f"{PKI_DIR}/easyrsa","gen-crl"], cwd=PKI_DIR)
+    run(["cp",f"{PKI_DIR}/pki/crl.pem",f"{OPENVPN_DIR}/crl.pem"])
+    return r
+
 def make_ovpn(name):
-  ca=open(f"{PKI_DIR}/pki/ca.crt").read()
-  cert=open(f"{PKI_DIR}/pki/issued/{name}.crt").read()
-  key=open(f"{PKI_DIR}/pki/private/{name}.key").read()
-  ta=open(f"{OPENVPN_DIR}/ta.key").read()
-  return f"""client
+    name=name.replace('/','').replace('..','')
+    ca=open(f"{PKI_DIR}/pki/ca.crt").read()
+    cert=open(f"{PKI_DIR}/pki/issued/{name}.crt").read()
+    key=open(f"{PKI_DIR}/pki/private/{name}.key").read()
+    ta=open(f"{OPENVPN_DIR}/ta.key").read()
+    return f"""client
 dev tun
 proto udp
 remote {SERVER_IP} 1194
+resolv-retry infinite
 nobind
 persist-key
 persist-tun
 remote-cert-tls server
 cipher AES-256-CBC
 auth SHA256
+verb 3
 <ca>\n{ca}\n</ca>
 <cert>\n{cert}\n</cert>
 <key>\n{key}\n</key>
@@ -171,62 +223,98 @@ key-direction 1
 @app.route('/')
 @auth.login_required
 def index():
-  clients=[r for r in sqlite3.connect(DB_PATH).execute("SELECT name,created_at FROM clients")]
-  connected=[]
-  try:
-    with open(STATUS_LOG) as f:
-      for l in f:
-        if l and not l.startswith('#') and ',' in l:
-          p=l.split(','); connected.append((p[0],p[1],p[2],p[5]))
-  except: pass
-  return render_template_string("""
-  <h2>OpenVPN Admin</h2>
-  <a href='/add'>Add</a> | <a href='/logs'>Logs</a> | <a href='/settings'>Settings</a>
-  <h3>Clients</h3><ul>{% for n,t in clients %}<li>{{n}} - {{t}} - <a href='/download/{{n}}'>.ovpn</a> - <a href='/revoke/{{n}}'>Revoke</a></li>{% endfor %}</ul>
-  <h3>Connected</h3><ul>{% for n,r,v,s in connected %}<li>{{n}} | {{r}} | {{v}} | since {{s}}</li>{% endfor %}</ul>
-  """,clients=clients,connected=connected)
+    conn=sqlite3.connect(DB_PATH)
+    rows=list(conn.execute("SELECT name,created_at FROM clients")); conn.close()
+    connected=[]
+    try:
+        with open(STATUS_LOG) as f:
+            for l in f:
+                if l and not l.startswith('#') and ',' in l:
+                    p=l.split(',')
+                    if len(p)>=6: connected.append((p[0],p[1],p[2],p[5]))
+    except: pass
+    return render_template_string("""
+    <h2>OpenVPN Admin</h2>
+    <p><a href='/add'>Add client</a> | <a href='/connected'>Connected</a> | <a href='/logs'>Logs</a> | <a href='/settings'>Settings</a></p>
+    <h3>Clients</h3>
+    <ul>{% for n,t in rows %}
+      <li>{{n}} - {{t}} - <a href='/download/{{n}}'>.ovpn</a> - <a href='/revoke/{{n}}'>Revoke</a></li>
+    {% endfor %}</ul>
+    """, rows=rows)
 
-@app.route('/add',methods=['GET','POST'])
+@app.route('/add', methods=['GET','POST'])
 @auth.login_required
 def add():
-  if request.method=='POST':
-    n=request.form['name']
-    create_client(n)
-    sqlite3.connect(DB_PATH).execute("INSERT OR REPLACE INTO clients VALUES(?,?)",(n,time.ctime()))
-    sqlite3.connect(DB_PATH).commit()
-    return redirect('/')
-  return "<form method=post>Name:<input name=name><button>Add</button></form>"
+    if request.method=='POST':
+        n=request.form.get('name','').strip()
+        if not n: return "Name required"
+        r=create_client(n)
+        conn=sqlite3.connect(DB_PATH)
+        conn.execute("INSERT OR REPLACE INTO clients VALUES(?,?)",(n,time.ctime()))
+        conn.commit(); conn.close()
+        return redirect('/')
+    return "<h3>Add client</h3><form method=post>Name: <input name=name><button>Create</button></form>"
 
 @app.route('/download/<n>')
 @auth.login_required
 def download(n):
-  fn=f"/tmp/{n}.ovpn"
-  open(fn,'w').write(make_ovpn(n))
-  return send_file(fn,as_attachment=True,download_name=f"{n}.ovpn")
+    fn=f"/tmp/{n}.ovpn"
+    open(fn,'w').write(make_ovpn(n))
+    return send_file(fn, as_attachment=True, download_name=f"{n}.ovpn")
 
 @app.route('/revoke/<n>')
 @auth.login_required
 def revoke(n):
-  revoke_client(n)
-  sqlite3.connect(DB_PATH).execute("DELETE FROM clients WHERE name=?",(n,))
-  sqlite3.connect(DB_PATH).commit()
-  return redirect('/')
+    revoke_client(n)
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM clients WHERE name=?",(n,)); conn.commit(); conn.close()
+    return redirect('/')
+
+@app.route('/connected')
+@auth.login_required
+def connected():
+    arr=[]
+    try:
+        with open(STATUS_LOG) as f:
+            for l in f:
+                if l and not l.startswith('#') and ',' in l:
+                    p=l.split(',')
+                    if len(p)>=6: arr.append((p[0],p[1],p[2],p[5]))
+    except Exception as e:
+        return f"Error: {e}"
+    s="<h3>Connected clients</h3><ul>"
+    for n,r,v,since in arr:
+        s+=f"<li>{n} | {r} | {v} | since {since}</li>"
+    s+="</ul><p><a href='/'>Back</a></p>"
+    return s
 
 @app.route('/logs')
 @auth.login_required
-def logs(): return "<pre>"+''.join(open(OPENVPN_LOG).read().splitlines()[-200:])+"</pre>"
+def logs():
+    try:
+        txt=''.join(open(OPENVPN_LOG).read().splitlines()[-300:])
+    except Exception as e:
+        txt=f'Error reading log: {e}'
+    return "<pre>"+txt+"</pre>"
 
-@app.route('/settings',methods=['GET','POST'])
+@app.route('/settings', methods=['GET','POST'])
 @auth.login_required
 def settings():
-  e=load_env()
-  if request.method=='POST':
-    u=request.form['u']; p=request.form['p']
-    if len(p)!=5: return "Password must be 5 chars"
-    with open(ENVFILE,'w') as f:
-      f.write(f"ADMIN_USER={u}\nADMIN_PASS={p}\n")
-    return "Updated, re-login"
-  return f"<form method=post>User:<input name=u value='{e['ADMIN_USER']}'><br>Pass(5 chars):<input name=p><button>Save</button></form>"
+    e=load_env()
+    if request.method=='POST':
+        u=request.form.get('u','').strip()
+        p=request.form.get('p','').strip()
+        if not u: return "Username required"
+        if len(p)!=5: return "Password must be exactly 5 characters (e.g. GK234)"
+        # merge + persist
+        e['ADMIN_USER']=u; e['ADMIN_PASS']=p
+        with open(ENVFILE,'w') as f:
+            for k,v in e.items(): f.write(f"{k}={v}\n")
+        return "Updated. Use new credentials next login."
+    return f"<form method=post>User:<input name=u value='{e.get('ADMIN_USER','openvpn')}'><br>Pass(5 chars):<input name=p><button>Save</button></form>"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=FLASK_PORT)
 PY
 
 cat > /etc/systemd/system/openvpn-admin.service <<EOF
@@ -244,13 +332,21 @@ User=root
 WantedBy=multi-user.target
 EOF
 
+echo "[7/8] Enabling Admin Panel..."
 systemctl daemon-reload
 systemctl enable openvpn-admin
 systemctl restart openvpn-admin
 
-echo "----------------------------------------"
+echo "[8/8] Final checks..."
+echo "OpenVPN unit   : $SYSTEMD_UNIT"
+systemctl --no-pager -l status "$SYSTEMD_UNIT" | tail -n 10 || true
+systemctl --no-pager -l status openvpn-admin | tail -n 10 || true
+
+echo "--------------------------------------------------"
 echo "INSTALLATION COMPLETE!"
-echo "OpenVPN is running on ${PROTO}/${OVPN_PORT}"
-echo "Admin panel: http://${SERVER_IP}:${FLASK_PORT}"
-echo "Login: ${ADMIN_USER} / ${ADMIN_PASS}"
-echo "----------------------------------------"
+echo "OpenVPN   : ${PROTO}/${OVPN_PORT} (Unit: ${SYSTEMD_UNIT})"
+echo "Admin URL : http://${SERVER_IP}:${FLASK_PORT}"
+echo "Login     : ${ADMIN_USER} / ${ADMIN_PASS}"
+echo "Files     : server.conf in /etc/openvpn/ and /etc/openvpn/server/"
+echo "Tip       : ufw allow ${OVPN_PORT}/${PROTO}  &&  ufw allow ${FLASK_PORT}/tcp"
+echo "--------------------------------------------------"
